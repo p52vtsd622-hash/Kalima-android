@@ -47,17 +47,48 @@ jobs:
           KALIMA_KEY_ALIAS: ${{ secrets.KALIMA_KEY_ALIAS }}
           KALIMA_KEY_PASSWORD: ${{ secrets.KALIMA_KEY_PASSWORD }}
         run: gradle testReleaseUnitTest assembleRelease --no-daemon --stacktrace
+      - name: Prepare and verify the signed APK
+        env:
+          KALIMA_KEYSTORE_PASSWORD: ${{ secrets.KALIMA_KEYSTORE_PASSWORD }}
+          KALIMA_KEY_ALIAS: ${{ secrets.KALIMA_KEY_ALIAS }}
+          KALIMA_KEY_PASSWORD: ${{ secrets.KALIMA_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for setting in KALIMA_KEYSTORE_PASSWORD KALIMA_KEY_ALIAS KALIMA_KEY_PASSWORD; do
+            if [ -z "${!setting}" ]; then
+              echo "::error::Missing signing secret: $setting. Keep using the original permanent Kalima key."
+              exit 1
+            fi
+          done
+          mapfile -d '' apks < <(find project/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print0)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected one release APK, found ${#apks[@]}. Check the Build and check Kalima step."
+            find project/app/build/outputs -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          apksigner=$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
+          if [ -z "$apksigner" ]; then
+            echo "::error::Android APK signing tool is missing."
+            exit 1
+          fi
+          "$apksigner" sign --ks "$RUNNER_TEMP/kalima.keystore" \
+            --ks-key-alias "$KALIMA_KEY_ALIAS" \
+            --ks-pass env:KALIMA_KEYSTORE_PASSWORD \
+            --key-pass env:KALIMA_KEY_PASSWORD \
+            --out Kalima.apk "${apks[0]}"
+          "$apksigner" verify --verbose Kalima.apk
+          test -s Kalima.apk
       - name: Keep the APK as a download on the run page
         uses: actions/upload-artifact@v4
         with:
           name: Kalima-APK
-          path: project/app/build/outputs/apk/release/app-release.apk
+          path: Kalima.apk
           if-no-files-found: error
       - name: Publish the APK on the Releases page
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp project/app/build/outputs/apk/release/app-release.apk Kalima.apk
           if gh release view latest >/dev/null 2>&1; then
             gh release upload latest Kalima.apk --clobber
             gh release edit latest --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
