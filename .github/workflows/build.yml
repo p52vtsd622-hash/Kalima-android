@@ -1,54 +1,69 @@
 name: Build Kalima APK
-
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: write
-
+concurrency:
+  group: kalima-release
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Get the files
         uses: actions/checkout@v4
-
       - name: Unpack the app project
         run: |
           mkdir -p project
           unzip -q kalima-android.zip -d project
-          ls -la project
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-
       - name: Accept Android licences
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-
-      - name: Build the APK
+      - name: Restore the permanent Kalima signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KALIMA_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Add Kalima signing secrets first. See START-HERE.md. No replacement key will be generated."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/kalima.keystore"
+          chmod 600 "$RUNNER_TEMP/kalima.keystore"
+      - name: Build and check Kalima
         working-directory: project
-        run: gradle assembleDebug --no-daemon --stacktrace
-
+        env:
+          KALIMA_KEYSTORE_PATH: ${{ runner.temp }}/kalima.keystore
+          KALIMA_KEYSTORE_PASSWORD: ${{ secrets.KALIMA_KEYSTORE_PASSWORD }}
+          KALIMA_KEY_ALIAS: ${{ secrets.KALIMA_KEY_ALIAS }}
+          KALIMA_KEY_PASSWORD: ${{ secrets.KALIMA_KEY_PASSWORD }}
+        run: gradle testReleaseUnitTest assembleRelease --no-daemon --stacktrace
       - name: Keep the APK as a download on the run page
         uses: actions/upload-artifact@v4
         with:
           name: Kalima-APK
-          path: project/app/build/outputs/apk/debug/app-debug.apk
-
+          path: project/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
       - name: Publish the APK on the Releases page
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp project/app/build/outputs/apk/debug/app-debug.apk Kalima.apk
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest Kalima.apk --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
+          cp project/app/build/outputs/apk/release/app-release.apk Kalima.apk
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest Kalima.apk --clobber
+            gh release edit latest --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
+          else
+            gh release create latest Kalima.apk --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
+          fi
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kalima.keystore"
