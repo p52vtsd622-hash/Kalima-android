@@ -2,6 +2,7 @@ name: Build Kalima APK
 on:
   push:
     branches: [main]
+    paths: [kalima-android.zip, .github/workflows/build.yml]
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,6 +12,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      KALIMA_UPDATE_REPOSITORY: ${{ github.repository }}
     steps:
       - name: Get the files
         uses: actions/checkout@v4
@@ -27,14 +30,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - name: Accept Android licences
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Prepare Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-34' 'build-tools;34.0.0'
       - name: Restore the permanent Kalima signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KALIMA_KEYSTORE_BASE64 }}
         run: |
+          set -euo pipefail
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::Add Kalima signing secrets first. See START-HERE.md. No replacement key will be generated."
+            echo '::error::Keep the original four KALIMA signing secrets. No replacement signing key will be generated.'
             exit 1
           fi
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/kalima.keystore"
@@ -46,55 +52,67 @@ jobs:
           KALIMA_KEYSTORE_PASSWORD: ${{ secrets.KALIMA_KEYSTORE_PASSWORD }}
           KALIMA_KEY_ALIAS: ${{ secrets.KALIMA_KEY_ALIAS }}
           KALIMA_KEY_PASSWORD: ${{ secrets.KALIMA_KEY_PASSWORD }}
-        run: gradle testReleaseUnitTest assembleRelease --no-daemon --stacktrace
-      - name: Prepare and verify the signed APK
-        env:
-          KALIMA_KEYSTORE_PASSWORD: ${{ secrets.KALIMA_KEYSTORE_PASSWORD }}
-          KALIMA_KEY_ALIAS: ${{ secrets.KALIMA_KEY_ALIAS }}
-          KALIMA_KEY_PASSWORD: ${{ secrets.KALIMA_KEY_PASSWORD }}
+        run: |
+          python3 verification/check_android_regex.py
+          gradle testReleaseUnitTest assembleRelease --no-daemon --stacktrace
+      - name: Verify APK identity and prepare update metadata
         shell: bash
         run: |
           set -euo pipefail
-          for setting in KALIMA_KEYSTORE_PASSWORD KALIMA_KEY_ALIAS KALIMA_KEY_PASSWORD; do
-            if [ -z "${!setting}" ]; then
-              echo "::error::Missing signing secret: $setting. Keep using the original permanent Kalima key."
-              exit 1
-            fi
-          done
-          mapfile -d '' apks < <(find project/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print0)
-          if [ "${#apks[@]}" -ne 1 ]; then
-            echo "::error::Expected one release APK, found ${#apks[@]}. Check the Build and check Kalima step."
-            find project/app/build/outputs -type f -name '*.apk' -print || true
-            exit 1
-          fi
-          apksigner=$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
-          if [ -z "$apksigner" ]; then
-            echo "::error::Android APK signing tool is missing."
-            exit 1
-          fi
-          "$apksigner" sign --ks "$RUNNER_TEMP/kalima.keystore" \
-            --ks-key-alias "$KALIMA_KEY_ALIAS" \
-            --ks-pass env:KALIMA_KEYSTORE_PASSWORD \
-            --key-pass env:KALIMA_KEY_PASSWORD \
-            --out Kalima.apk "${apks[0]}"
-          "$apksigner" verify --verbose Kalima.apk
-          test -s Kalima.apk
-      - name: Keep the APK as a download on the run page
+          mkdir -p release
+          source_apk=project/app/build/outputs/apk/release/app-release.apk
+          tools="$ANDROID_HOME/build-tools/34.0.0"
+          python3 project/verification/verify_dex.py "$source_apk"
+          "$tools/apksigner" verify --verbose --print-certs "$source_apk" > "$RUNNER_TEMP/apk-signature.txt"
+          grep -Fq 'b3015109ce8b212b6549381ef0b274b0954f22e382a064b06481135928b84500' "$RUNNER_TEMP/apk-signature.txt"
+          "$tools/aapt" dump badging "$source_apk" > "$RUNNER_TEMP/apk-badging.txt"
+          python3 project/verification/check_release_apk.py "$RUNNER_TEMP/apk-badging.txt" "$source_apk" release
+          python3 project/verification/make_update_manifest.py \
+            --repository "$KALIMA_UPDATE_REPOSITORY" \
+            --apk "release/$(cat release/asset-name.txt)" \
+            --version-code "$(cat release/version-code.txt)" \
+            --version-name "$(cat release/version-name.txt)" \
+            --min-sdk "$(cat release/min-sdk.txt)" \
+            --notes project/RELEASE-NOTES.txt --output release/update.json
+          cp "$source_apk" release/Kalima.apk
+      - name: Keep APK and update metadata on the run page
         uses: actions/upload-artifact@v4
         with:
           name: Kalima-APK
-          path: Kalima.apk
+          path: |
+            release/*.apk
+            release/update.json
           if-no-files-found: error
-      - name: Publish the APK on the Releases page
+      - name: Publish the APK and update feed
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest Kalima.apk --clobber
-            gh release edit latest --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
-          else
-            gh release create latest Kalima.apk --title "Kalima latest build" --notes "Newest build of the Kalima Android app." --target "${{ github.sha }}"
+          set -euo pipefail
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.private')" = true ]; then
+            echo '::error::In-app updates need publicly downloadable release assets. This repository is private. The signed APK remains in the run artifact. Use a public distribution repository; never embed a GitHub token in the app.'
+            exit 1
           fi
+          mkdir -p previous
+          existing=$(gh release list --limit 100 --json tagName --jq '[.[] | select(.tagName == "latest")] | length')
+          if [ "$existing" -gt 0 ]; then
+            gh release view latest --json assets --jq '.assets[].name' > previous/assets.txt
+            if grep -Fxq update.json previous/assets.txt; then
+              gh release download latest --pattern update.json --dir previous
+            fi
+          fi
+          python3 project/verification/check_update_version.py previous/update.json release/update.json
+          version=$(cat release/version-name.txt)
+          asset=$(cat release/asset-name.txt)
+          if [ "$existing" -eq 0 ]; then
+            gh release create latest --title "Kalima $version" --notes-file project/RELEASE-NOTES.txt --target "$GITHUB_SHA"
+          fi
+          # Upload the version-specific APK first; old manifests keep their old URL until ready.
+          gh release upload latest "release/$asset" --clobber
+          gh release upload latest release/Kalima.apk --clobber
+          gh release edit latest --title "Kalima $version" --notes-file project/RELEASE-NOTES.txt --target "$GITHUB_SHA"
+          # Publishing metadata last makes the new update discoverable.
+          gh release upload latest release/update.json --clobber
       - name: Remove temporary signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/kalima.keystore"
